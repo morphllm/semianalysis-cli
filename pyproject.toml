@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semianalysis-cli"
+version = "0.1.0"
+description = "Derive real $/1M-token serving cost from SemiAnalysis InferenceX benchmarks and compare with OpenRouter."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Morph", email = "info@morphllm.com" }]
+keywords = ["semianalysis", "inferencex", "llm", "inference", "gpu", "cost", "openrouter"]
+dependencies = [
+    "typer>=0.9",
+    "rich>=13.0",
+    "requests>=2.28",
+]
+
+[project.urls]
+Homepage = "https://github.com/morphllm/semianalysis-cli"
+Repository = "https://github.com/morphllm/semianalysis-cli"
+
+[project.scripts]
+semianalysis = "semianalysis_cli.cli:run"
+
+[tool.setuptools]
+packages = ["semianalysis_cli"]
