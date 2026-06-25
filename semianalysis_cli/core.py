@@ -1,10 +1,9 @@
-"""SemiAnalysis InferenceX cost analysis + OpenRouter price comparison.
+"""SemiAnalysis InferenceX cost analysis.
 
 SemiAnalysis (inferencex.semianalysis.com) publishes per-GPU throughput
 benchmarks for open models across hardware/framework/precision/spec-method.
 From a throughput number and a GPU rental rate we can derive the *actual*
-serving cost in $/1M tokens, then hold it against what OpenRouter providers
-sell the same model for.
+serving cost in $/1M tokens.
 
 Cost model (lifted verbatim from their bundle):
 
@@ -64,23 +63,9 @@ MODEL_ALIASES = {
     "llama3.1": "Llama-3.1-70B-Instruct-FP8-KV",
 }
 
-# SemiAnalysis model → best-guess OpenRouter slug for the price comparison.
-# Override per-call with --openrouter; these are sensible defaults.
-OPENROUTER_SLUGS = {
-    "GLM-5": "z-ai/glm-5",
-    "DeepSeek-V4-Pro": "deepseek/deepseek-v4-pro",
-    "DeepSeek-R1-0528": "deepseek/deepseek-r1-0528",
-    "MiniMax-M3": "minimax/minimax-m3",
-    "MiniMax-M2.5": "minimax/minimax-m2.5",
-    "Kimi-K2.5": "moonshotai/kimi-k2.5",
-    "Qwen-3.5-397B-A17B": "qwen/qwen3.5-397b-a17b",
-    "gpt-oss-120b": "openai/gpt-oss-120b",
-    "Llama-3.3-70B-Instruct-FP8": "meta-llama/llama-3.3-70b-instruct",
-    "Llama-3.1-70B-Instruct-FP8-KV": "meta-llama/llama-3.1-70b-instruct",
-}
-
-# Exact API model names (for help text / validation).
-KNOWN_MODELS = sorted(set(OPENROUTER_SLUGS))
+# Exact SemiAnalysis API model names (for help text / validation), derived from
+# the alias targets so there's one source of truth.
+KNOWN_MODELS = sorted(set(MODEL_ALIASES.values()))
 
 
 def resolve_model(name: str) -> str:
@@ -177,46 +162,3 @@ def select(
         sp_pool = fw_pool
 
     return sp_pool, notes
-
-
-# ── OpenRouter ─────────────────────────────────────────────────────
-
-OR_BASE = "https://openrouter.ai/api/v1"
-
-
-def _price_pair(pricing: dict) -> tuple[float, float]:
-    return float(pricing.get("prompt") or 0) * 1e6, float(pricing.get("completion") or 0) * 1e6
-
-
-def openrouter_pricing(slug: str, timeout: int = 25) -> Optional[dict]:
-    """List price + per-provider min/median for an OpenRouter model slug.
-
-    Returns None if the slug is unknown. `list_*` is the headline price;
-    `min_*` is the cheapest provider; `providers` is the count.
-    """
-    try:
-        r = requests.get(f"{OR_BASE}/models/{slug}/endpoints", timeout=timeout)
-        r.raise_for_status()
-        d = r.json().get("data", {})
-    except Exception:
-        return None
-    eps = d.get("endpoints", [])
-    if not eps:
-        return None
-    ins, outs = [], []
-    for e in eps:
-        i, o = _price_pair(e.get("pricing", {}))
-        ins.append(i)
-        outs.append(o)
-    outs_sorted = sorted(outs)
-    med = outs_sorted[len(outs_sorted) // 2]
-    # Headline list price = the model object's own pricing (first endpoint matches it).
-    list_in, list_out = _price_pair(eps[0].get("pricing", {}))
-    return {
-        "name": d.get("name", slug),
-        "slug": slug,
-        "providers": len(eps),
-        "list_in": list_in, "list_out": list_out,
-        "min_in": min(ins), "min_out": min(outs),
-        "median_out": med,
-    }

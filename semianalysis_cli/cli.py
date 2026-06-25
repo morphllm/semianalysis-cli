@@ -2,12 +2,15 @@
 
 Pulls SemiAnalysis InferenceX per-GPU throughput for an open model, prefers the
 dynamo-sglang + MTP serving recipe (falls back and says so when unavailable),
-converts throughput → $/1M tokens at a GPU rental tier, then holds the cheapest
-achievable cost against what OpenRouter providers sell the same model for.
+and converts throughput → $/1M tokens at a GPU rental tier. With `--plot` it
+also writes a cost-vs-load + throughput-vs-load chart.
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 from typing import Optional
 
 import typer
@@ -28,17 +31,22 @@ def main(
     framework: str = typer.Option("dynamo-sglang", "--framework", "-f", help="Serving framework filter, or 'any'."),
     spec: str = typer.Option("mtp", "--spec", help="Speculative decode method: mtp, none, or 'any'."),
     hardware: Optional[str] = typer.Option(None, "--hardware", "-hw", help="Restrict to one GPU (gb300, b200, mi355x, ...)."),
-    openrouter: Optional[str] = typer.Option(None, "--openrouter", "-or", help="Override the OpenRouter slug for price comparison."),
-    limit: int = typer.Option(0, "--limit", "-l", help="Max rows to show (0 = all)."),
-    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Max rows to show (0 = all; table format only)."),
+    fmt: str = typer.Option("table", "--format", "-F", help="Output format: table, json, or csv."),
+    out: Optional[str] = typer.Option(None, "--out", "-o", help="Write json/csv to this file instead of stdout."),
+    json_out: bool = typer.Option(False, "--json", help="Shorthand for --format json."),
 ):
-    """Derive actual $/1M-token serving cost from SemiAnalysis benchmarks and compare with OpenRouter.
+    """Derive actual $/1M-token serving cost from SemiAnalysis benchmarks.
 
     Pulls per-GPU throughput for the model, prefers the dynamo-sglang + MTP recipe
-    (falls back and says so when unavailable), converts throughput → $/1M tokens at a
-    GPU rental tier, then holds the cheapest achievable output cost against what
-    OpenRouter providers sell the same model for.
+    (falls back and says so when unavailable), and converts throughput → $/1M tokens
+    at a GPU rental tier. Emit a Rich table (default), JSON, or CSV — the json/csv
+    rows carry the full raw benchmark record plus the derived cost fields.
     """
+    fmt = "json" if json_out else fmt.lower()
+    if fmt not in ("table", "json", "csv"):
+        console.print(f"[red]Unknown format '{fmt}'[/red] [dim](use: table, json, csv)[/dim]")
+        raise typer.Exit(1)
     if tier not in sa.TIERS:
         console.print(f"[red]Unknown tier '{tier}'[/red] [dim](use: {', '.join(sa.TIERS)})[/dim]")
         raise typer.Exit(1)
@@ -81,9 +89,6 @@ def main(
     # Sort by hardware then concurrency for a readable cost-vs-load curve.
     enriched.sort(key=lambda r: (r.get("hardware", ""), r.get("conc", 0)))
 
-    or_slug = openrouter or sa.OPENROUTER_SLUGS.get(sa_model)
-    or_price = sa.openrouter_pricing(or_slug) if or_slug else None
-
     # Cheapest output cost (best margin) + lowest-latency interactive point.
     costed = [r for r in enriched if r.get("cost_out") is not None]
     cheapest = min(costed, key=lambda r: r["cost_out"]) if costed else None
@@ -92,16 +97,20 @@ def main(
         key=lambda r: r["metrics"]["mean_ttft"], default=None,
     )
 
-    if json_out:
-        import json
-        # Plain print, not console.print — Rich hard-wraps at terminal width and
-        # corrupts the JSON.
-        print(json.dumps({
+    if fmt == "json":
+        payload = {
             "model": sa_model, "date": use_date, "tier": tier,
             "framework": framework, "spec": spec,
             "notes": notes, "records": enriched,
-            "cheapest_output": cheapest, "openrouter": or_price,
-        }, indent=2, default=str))
+            "cheapest_output": cheapest,
+        }
+        text = json.dumps(payload, indent=2, default=str)
+        _emit(text, out)
+        return
+
+    if fmt == "csv":
+        text = _to_csv(enriched)
+        _emit(text, out)
         return
 
     console.print(
@@ -165,26 +174,48 @@ def main(
             f"{fm.get('mean_tpot', 0) * 1000:.1f}ms/tok @ conc={fastest.get('conc')} "
             f"[dim]→ {_money(fastest.get('cost_out'))}/1M out[/dim]"
         )
+    console.print("[dim]→ --format json|csv for the full raw benchmark data.[/dim]")
 
-    if or_price:
-        console.print(
-            f"\n[bold]OpenRouter[/bold] [cyan]{or_price['slug']}[/cyan] "
-            f"[dim]({or_price['providers']} providers)[/dim]: "
-            f"list [bold]${or_price['list_out']:.2f}[/bold]/1M out (${or_price['list_in']:.2f} in), "
-            f"cheapest ${or_price['min_out']:.2f} out"
-        )
-        if cheapest and cheapest["cost_out"]:
-            list_mult = or_price["list_out"] / cheapest["cost_out"]
-            min_mult = or_price["min_out"] / cheapest["cost_out"]
-            console.print(
-                f"  [green]→ our cost is {list_mult:.1f}× below OpenRouter list, "
-                f"{min_mult:.1f}× below the cheapest provider[/green] "
-                f"[dim](output tokens, {tier} GPU rate)[/dim]"
-            )
-    elif or_slug:
-        console.print(f"\n[yellow]OpenRouter slug '{or_slug}' not found[/yellow] [dim](pass --openrouter <slug>)[/dim]")
+
+def _emit(text: str, out: Optional[str]) -> None:
+    """Write `text` to a file when `out` is given, else stdout.
+
+    Plain stdout, not console.print — Rich would hard-wrap and corrupt JSON/CSV.
+    """
+    if out:
+        with open(out, "w", newline="") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        console.print(f"[green]wrote[/green] {out}")
     else:
-        console.print(f"\n[dim]No OpenRouter mapping for {sa_model}; pass --openrouter <slug> to compare.[/dim]")
+        print(text)
+
+
+def _to_csv(records: list[dict]) -> str:
+    """Flatten enriched records to CSV: scalar top-level cols + metrics.* + costs.
+
+    `metrics` is exploded into `metric_<name>` columns; the column set is the
+    union across all rows so heterogeneous records still line up.
+    """
+    flat_rows = []
+    for r in records:
+        flat = {k: v for k, v in r.items() if k not in ("metrics", "workers")}
+        for mk, mv in (r.get("metrics") or {}).items():
+            flat[f"metric_{mk}"] = mv
+        flat_rows.append(flat)
+
+    columns: list[str] = []
+    seen = set()
+    for row in flat_rows:
+        for k in row:
+            if k not in seen:
+                seen.add(k)
+                columns.append(k)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(flat_rows)
+    return buf.getvalue()
 
 
 def _money(v: Optional[float]) -> str:
